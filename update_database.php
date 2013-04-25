@@ -2,18 +2,35 @@
 <?php
 require "color_terminal.php";
 
-$ignored_files = array("update_database.php", "create_migration.php", "README.txt", "color_terminal.php", "config.php", "config-example.php");
+$file_dir = realpath(dirname($argv[0]));
 
-if(file_exists("config.php")) {
-	require "config.php";
+if(file_exists("$file_dir/config.php")) {
+	require "$file_dir/config.php";
+} else if(file_exists(dirname(__FILE__)."/config.php")) {
+	$file_dir = dirname(__FILE__);
+	require "$file_dir/config.php";
 } else {
 	die("Please create config.php. You can look at config-example.php for ideas.\n");
 }
 
+$ignored_files = array(
+	'^\..*',                        /* skip hidden files */
+	'(?<!\.(php|sql))$',            /* everything not .php or .sql */
+	'^(update_database|create_migration|config(-example)?|color_terminal)\.php$',
+);
+
+/* append project-wide ignores */
+if ( is_callable(array('Config', 'ignored')) ){
+	$ignored_files = array_merge($ignored_files, Config::ignored());
+}
+
 function usage() {
 	global $argv;
-	echo "Usage: ".$argv[0]." <username>\n";
-	echo "Username my be optional, depending on your config file.\n";
+	echo "Usage: ".$argv[0]." [options] <username>\n";
+	echo "Username may be optional, depending on your config file.\n";
+	echo "Options:\n";
+	echo "\t --check (-c): Checks if there are migrations to run, won't run any migrations.\n";
+	echo "\t --help (-h): Show this text.\n";
 	die();
 }
 
@@ -21,18 +38,24 @@ if($argc > 2) {
 	usage();
 }
 
+$check_only = false; /* True if we should only check if there are migrations to run */
+$username = null;
+
 if(isset($argv[1])) {
 	if($argv[1] == "--help" || $argv[1] == '-h') {
 		usage();
+	} else if($argv[1] == "--check" || $argv[1] == '-c') {
+		$check_only = true;
+		if(isset($argv[2])) {
+			$username = $argv[2];
+		}
+	} else {
+		$username = $argv[1];
 	}
-	$username = $argv[1];
-} else {
-	$username = null;
 }
 
 function ask_for_password() {
 	echo "Password: ";
-	ob_flush();
 	flush();
 	system('stty -echo');
 	$password = trim(fgets(STDIN));
@@ -47,31 +70,66 @@ try {
 	die("fix_database misslyckades. Exception: ".$e->getMessage()."\n");
 }
 
+if($check_only) {
+	$count = 0;
+	foreach(migration_list() as $version => $file) {
+		if(!migration_applied($version)) ++$count;
+	}
+
+	if($count > 0) {
+		echo "There are $count new migration(s) to run\n";
+	} else {
+		echo "Database up-to-date\n";
+	}
+	exit($count);
+}
+
 create_migration_table_if_not_exists();
 
 $db->autocommit(FALSE);
+
+run_hook("begin");
+
 foreach(migration_list() as $version => $file) {
 	if(!migration_applied($version)) {
 		run_migration($version,$file);
 	}
 }
+
 ColorTerminal::set("green");
 echo "All migrations completed\n";
 ColorTerminal::set("normal");
 
+run_hook("end");
+
+
 $db->close();
+
+function is_ignored($filename, &$match){
+	global $ignored_files;
+
+	/* skip files in ignore list */
+	foreach ( $ignored_files as $pattern ){
+		if ( preg_match("/$pattern/", $filename) ){
+			$match = $pattern;
+			return true;
+		}
+	}
+
+	return false;
+}
 
 /**
  * Creates a hash :migration_version => file_name
  */
 function migration_list() {
-	global $ignored_files;
-	$dir = opendir(dirname(__FILE__));
+	global $file_dir;
+	$dir = opendir($file_dir);
 	$files = array();
 	while($f = readdir()) {
-		if($f[0] != "." && ! in_array($f,$ignored_files)) {
-			$files[get_version($f)] = $f;
-		}
+		if ( is_ignored($f, $match) ) continue;
+
+		$files[get_version($f)] = $f;
 	}
 	ksort($files);
 	closedir($dir);
@@ -98,13 +156,16 @@ function manual_step_confirm() {
  * Runs the migration
  */
 function run_migration($version, $filename) {
-	global $db;
+	global $db, $file_dir;
 	try {
-		$ext = end(explode('.', $filename));
+		$ext = pathinfo($filename,  PATHINFO_EXTENSION);
+
+		run_hook("pre_migration", $filename);
+
 		ColorTerminal::set("blue");
 		echo "============= BEGIN $filename =============\n";
 		ColorTerminal::set("normal");
-		if(filesize(dirname(__FILE__)."/$filename") == 0) {
+		if(filesize("$file_dir/$filename") == 0) {
 			ColorTerminal::set("red");
 			echo "$filename is empty. Migrations aborted\n";
 			ColorTerminal::set("normal");
@@ -114,12 +175,12 @@ function run_migration($version, $filename) {
 			case "php":
 				echo "Parser: PHP\n";
 				{
-					require dirname(__FILE__)."/$filename";
+					require "$file_dir/$filename";
 				}
 				break;
 			case "sql":
 				echo "Parser: MySQL\n";
-				$queries = preg_split("/;[[:space:]]*\n/",file_contents(dirname(__FILE__)."/$filename"));
+				$queries = preg_split("/;[[:space:]]*\n/",file_contents("$file_dir/$filename"));
 				foreach($queries as $q) {
 					$q = trim($q);
 					if($q != "") {
@@ -146,6 +207,8 @@ function run_migration($version, $filename) {
 		echo "============= END $filename =============\n";
 		ColorTerminal::set("normal");
 
+		run_hook("post_migration", $filename);
+
 	} catch (Exception $e) {
 		ColorTerminal::set("red");
 		if($e instanceof QueryException) {
@@ -158,11 +221,14 @@ function run_migration($version, $filename) {
 		$db->rollback();
 		echo "All following migrations aborted\n";
 		ColorTerminal::set("normal");
+
+		run_hook("post_rollback", $filename);
+
 		exit;
 	}
 }
 
-/** 
+/**
  * Returns true if the specified version is applied
  */
 function migration_applied($version) {
@@ -203,6 +269,17 @@ function file_contents($filename) {
 	return $contents;
 }
 
+function run_hook($hook, $arg = null) {
+	$hook_method = $hook . "_hook";
+	if ( is_callable(array('Config', $hook_method)) ){
+		if($arg == null) {
+			call_user_func("Config::" . $hook_method);
+		} else {
+			call_user_func("Config::" . $hook_method, $arg);
+		}
+	}
+}
+
 /**
  * Creates the migration table if is does not exist
  */
@@ -212,7 +289,7 @@ function create_migration_table_if_not_exists() {
 		`version` varchar(255) COLLATE utf8_unicode_ci NOT NULL,
 		`timestamp` TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
 		UNIQUE KEY `unique_schema_migrations` (`version`)
-		)");
+		) ENGINE=InnoDB DEFAULT CHARSET=utf8 COLLATE=utf8_unicode_ci; ");
 }
 
 class QueryException extends Exception{
